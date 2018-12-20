@@ -1,0 +1,8 @@
+proj.user
+.Rhistory
+.RData
+.Ruserdata
+origin/
+result*/
+
+.Rproj.user
