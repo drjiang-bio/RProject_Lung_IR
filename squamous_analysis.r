@@ -14,7 +14,8 @@ annot <- read.csv('origin/Porcine.na36.annot.csv', comment.char = '#')
 annot2 <- annot[,c(1,15)]
 annot2 <- annot2[!grepl('^---$', annot2$Gene.Symbol),]
 
-# 方差分析
+# 1.方差分析
+# ------------------------------------------------------------
 res <- apply(eset, 1, function(x) {
   rt <- data.frame(t(rbind(expression=x, grade=c(1,2,3))))
   fit <- aov(expression ~ grade, data=rt)
@@ -32,55 +33,74 @@ genes <- dplyr::arrange(genes, pval)
 genes <- genes[!duplicated(genes$symbol),]
 write.csv(genes, file = './result/genes_aov_p05.csv')
 
-# 注释
-# 1
+# 2. 注释
+# ----------------------------------------------------------------
 library(dplyr)
+library(data.table)
+
 eset$symbol <- annot2[match(rownames(eset), annot2$Probe.Set.ID), 2]
 eset <- na.omit(eset)
-library(data.table)
+
 eset <- data.table(eset)
 eset <- eset[, lapply(.SD, median), by=symbol]
-eset <- data.frame(eset)
+
+# 3. 根据两个联合条件筛选
+# -----------------------------------------------------------------
+# 建立条件
 eset$bi32 <- eset[,3] / eset[,2]
 eset$bi43 <- eset[,4] / eset[,3]
 
 index1 <- eset$bi32 < 1.2 & eset$bi32 > 0.8
 sum(index1, na.rm = T)
-index2 <- eset$bi43 > 2 | eset$bi43 < 0.5
+index2 <- eset$bi43 > 1.5 | eset$bi43 < 0.6
+sum(index2, na.rm = T)
 index <- index1 & index2
 sum(index, na.rm = T)
 
+# 待选
 eset_s <- eset[index, ]
 eset_s <- eset_s[eset_s$bi32 != 0,]
 eset_s <- eset_s[eset_s$bi32 != Inf,]
 eset_s <- na.omit(eset_s)
 eset_s <- arrange(eset_s, desc(bi43))
-write.csv(eset_s, file='./result/eset_double_filter.csv', row.names = F)
-eset_sig <- read.csv('./result/eset_double_filter.csv')
+write.csv(eset_s, file='./result/eset_double_filter_15_06.csv', row.names = F)
+
+# 通路分析
+# ----------------------------------
+
+# 1. clusterProfiler 通路分析
+# eset_s <- read.csv('./result/eset_double_filter.csv')
 library(clusterProfiler)
-library(org.Hs.eg.db)
-keytypes(org.Hs.eg.db)
 library(org.Ss.eg.db)
 keytypes(org.Ss.eg.db)
-ego <- enrichGO(gene = eset_sig$symbol, OrgDb = org.Ss.eg.db,
+ego <- enrichGO(gene = eset_s$symbol, OrgDb = org.Ss.eg.db,
                 keyType = 'SYMBOL', ont = "ALL",
                 pAdjustMethod = "BH", pvalueCutoff = 0.05,
                 qvalueCutoff = 0.5, minGSSize = 1)
 ego@result
 
-ids <- bitr(eset_sig$symbol, fromType="SYMBOL", toType="UNIPROT", OrgDb="org.Ss.eg.db")
+ids <- bitr(eset_s$symbol, fromType="SYMBOL", toType="UNIPROT", OrgDb="org.Ss.eg.db")
 kk <- enrichKEGG(gene = ids,
                  organism = 'ssc',
                  pvalueCutoff = 0.05)
-file <- list.files('./result/', pattern = '^david', full.names = T)
-david <- lapply(file[1:4], function(x) read.table(x, header = T, sep = '\t'))
-file[1:4]
+
+# 2. 本地导入David结果分析通路
+file <- list.files('./result/david2/', pattern = '^david', full.names = T)
+david <- lapply(file[c(1,2,4,5)], function(x) read.table(x, header = T, sep = '\t'))
+file[c(1,2,4,5)]
 names(david) <- c('BP', 'CC', 'KEGG', 'MF')
 david <- do.call(rbind, david)
 david <- dplyr::arrange(david, Category, PValue)
 dav <- dplyr::filter(david, PValue < 0.05)
+dav$Category <-  sapply(strsplit(dav$Category,'_'), function(x) {
+  paste0(x[1], '_', x[2])
+  })
 
-write.csv(dav, file = './result/david_all.csv', row.names = F)
+a <-sapply(strsplit(dav$Term[1:21],'~'), function(x) x[2])
+b <- sapply(strsplit(dav$Term[22:26],':'), function(x) x[2])
+dav$Term <- c(a, b)
+
+write.csv(dav, file = './result/david2/david_all_term_jian.csv', row.names = F)
 
 library(ggplot2)
 ggplot(data = dav, aes(x=reorder(Term, PValue), y=-log10(PValue), fill=Category)) + 
@@ -96,12 +116,14 @@ ggplot(data = dav, aes(x=reorder(Term, PValue), y=-log10(PValue), fill=Category)
         plot.title = element_text(vjust = -7, hjust = -0.42),
         panel.border = element_blank(), 
         axis.line = element_line(colour = 'black', size = 1, 
-                                 lineend = 'square'))# +
+                                 lineend = 'square')) +
   facet_grid(. ~ Category, scales = 'free') +
   theme(strip.text = element_text(face = 'bold', size = rel(1.1)),
         strip.background = element_rect(fill = 'lightblue', 
-                                        colour = 'black', size = 1))
-ggsave('./result/david_all.pdf', width = 12, height = 8, units = 'in')
+                                        colour = 'black', size = 1)) +
+  theme(legend.position = c(-0.7,0.1), legend.justification = c(0,0),
+        legend.background = element_rect(fill = 'white', colour = 'black'))
+ggsave('./result/david2/david_all.pdf', width = 13, height = 7, units = 'in')
 
 
 
