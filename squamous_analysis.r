@@ -4,45 +4,232 @@ library(limma)
 library(Vennerable)
 options(stringsAsFactors = F)
 
-BiocManager::install(c("RBGL","graph"))
-install.packages("devtools");library(devtools)
-install_github("js229/Vennerable")
-
-
 eset <- read.table('./origin/GSE75560_series_matrix.txt', header = T, 
                    sep = '\t', comment.char = '!', row.names = 1)
 range(eset[,1])
 targets <- read.table('./origin/GSE75560/phen_gse75560.txt', 
                       sep = '\t', header = T)
-type <- targets$class
-names(eset) <- targets$class
 
-gene_diff <- function(data_methy) {
-  # 本函数需对beta矩阵 事先排序, 将正常样本至于矩阵前列
-  # 本函数需 事先计算 对照（正常）与实验组（癌症）的样本数目
-  # dara_methy:处理好的基因总体平均甲基化beta值矩阵，列为样本，行为基因;
-  # normalNum: 正常样品的数目; tumorNum: 癌症样品的数目
-  # grade: 样本分类信息，使用数字向量(1,1,2,2,2)，对应矩阵样本，须正常样本在前列
-  data = data_methy
-  res_l <- apply(data, 1, function(x) {
-    rt <- rbind(expression=x, grade=c(1,2,2))
-    rt <- as.matrix(t(rt))
-    wilcoxTest <- wilcox.test(expression ~ grade, data=rt)
-    logFC = log2(x[1] + 1)-log2(x[2] + 1)
-    return(c(logFC, wilcoxTest$p.value))
-    })
-  res_df <- data.frame(t(do.call(cbind, res_l)))
-  names(res_df) <- c('logFC', 'pvalue')
-  #对p值进行矫正
-  fdr <- p.adjust(as.numeric(as.vector(res_df[,'pvalue'])), method="fdr")
-  res_df <- cbind(res_df, FDR=fdr)
-  return(res_df)
-}
+annot <- read.csv('origin/Porcine.na36.annot.csv', comment.char = '#')
+annot2 <- annot[,c(1,15)]
+annot2 <- annot2[!grepl('^---$', annot2$Gene.Symbol),]
+
+# 方差分析
+res <- apply(eset, 1, function(x) {
+  rt <- data.frame(t(rbind(expression=x, grade=c(1,2,3))))
+  fit <- aov(expression ~ grade, data=rt)
+  summ <- summary(fit)
+  pvalue <- summ[[1]]$`Pr(>F)`[1]
+  return(pvalue)
+})
+
+genedf <- data.frame(res, check.names = F)
+genedf$symbol <- annot2[match(rownames(genedf), annot2$Probe.Set.ID), 2]
+genedf <- na.omit(genedf)
+names(genedf)[1] <- 'pval'
+genes <- genedf[genedf$pval<0.05,]
+genes <- dplyr::arrange(genes, pval)
+genes <- genes[!duplicated(genes$symbol),]
+write.csv(genes, file = './result/genes_aov_p05.csv')
+
+# 注释
+# 1
+library(dplyr)
+eset$symbol <- annot2[match(rownames(eset), annot2$Probe.Set.ID), 2]
+eset <- na.omit(eset)
+library(data.table)
+eset <- data.table(eset)
+eset <- eset[, lapply(.SD, median), by=symbol]
+eset <- data.frame(eset)
+eset$bi32 <- eset[,3] / eset[,2]
+eset$bi43 <- eset[,4] / eset[,3]
+
+index1 <- eset$bi32 < 1.2 & eset$bi32 > 0.8
+sum(index1, na.rm = T)
+index2 <- eset$bi43 > 2 | eset$bi43 < 0.5
+index <- index1 & index2
+sum(index, na.rm = T)
+
+eset_s <- eset[index, ]
+eset_s <- eset_s[eset_s$bi32 != 0,]
+eset_s <- eset_s[eset_s$bi32 != Inf,]
+eset_s <- na.omit(eset_s)
+eset_s <- arrange(eset_s, desc(bi43))
+write.csv(eset_s, file='./result/eset_double_filter.csv', row.names = F)
+eset_sig <- read.csv('./result/eset_double_filter.csv')
+library(clusterProfiler)
+library(org.Hs.eg.db)
+keytypes(org.Hs.eg.db)
+library(org.Ss.eg.db)
+keytypes(org.Ss.eg.db)
+ego <- enrichGO(gene = eset_sig$symbol, OrgDb = org.Ss.eg.db,
+                keyType = 'SYMBOL', ont = "ALL",
+                pAdjustMethod = "BH", pvalueCutoff = 0.05,
+                qvalueCutoff = 0.5, minGSSize = 1)
+ego@result
+
+ids <- bitr(eset_sig$symbol, fromType="SYMBOL", toType="UNIPROT", OrgDb="org.Ss.eg.db")
+kk <- enrichKEGG(gene = ids,
+                 organism = 'ssc',
+                 pvalueCutoff = 0.05)
+file <- list.files('./result/', pattern = '^david', full.names = T)
+david <- lapply(file[1:4], function(x) read.table(x, header = T, sep = '\t'))
+file[1:4]
+names(david) <- c('BP', 'CC', 'KEGG', 'MF')
+david <- do.call(rbind, david)
+david <- dplyr::arrange(david, Category, PValue)
+dav <- dplyr::filter(david, PValue < 0.05)
+
+write.csv(dav, file = './result/david_all.csv', row.names = F)
+
+library(ggplot2)
+ggplot(data = dav, aes(x=reorder(Term, PValue), y=-log10(PValue), fill=Category)) + 
+  geom_bar(stat = 'identity', position = 'dodge', width = 0.7) +
+  scale_y_continuous(expand = c(0,0)) + 
+  coord_flip() +
+  theme_bw() + # ggtitle('Biologiacl Progress') +
+  theme(axis.title.y = element_blank(),
+        axis.text = element_text(face = 'italic', colour = 'black', 
+                                 size = 12),
+        axis.title = element_text(face = 'italic', colour = 'black', 
+                                  size = 12),
+        plot.title = element_text(vjust = -7, hjust = -0.42),
+        panel.border = element_blank(), 
+        axis.line = element_line(colour = 'black', size = 1, 
+                                 lineend = 'square'))# +
+  facet_grid(. ~ Category, scales = 'free') +
+  theme(strip.text = element_text(face = 'bold', size = rel(1.1)),
+        strip.background = element_rect(fill = 'lightblue', 
+                                        colour = 'black', size = 1))
+ggsave('./result/david_all.pdf', width = 12, height = 8, units = 'in')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+eset$bi32 <- eset[,3] / eset[,2]
+eset$ca32 <- eset[,3] - eset[,2]
+
+
+eset_or <- eset[order(eset$bi32), ]
+eset_q <- dplyr::filter(eset_or, bi32 != 0 & bi32 != Inf)
+write.csv(genes, file = './result/genes_aov_p05.csv')
+
+aov_eset <- merge(genes, eset_q, by='symbol')
+library(data.table)
+aov_eset <- data.table(aov_eset)
+tt <- aov_eset[, lapply(.SD, median), by=symbol]
+write.csv(tt, file = 'result/genes_anov_p05_eset_unique.csv')
+sum(tt$bi32  > 1.5 | tt$bi32 < 0.5)
+sum(tt$bi32 < 0.8)
+range(tt$bi32)
+
+eset_sig <- rbind(head(eset_q, 200), tail(eset_q, 200))
+eset_sig <- dplyr::arrange(eset_sig, bi32)
+eset_sig2 <- with(eset_q, eset_q[bi32 > 1 | bi32 < 0.5,])
+
+write.csv(eset_sig, file = './result/eset_sig400.csv')
+eset_sig <- read.csv('./result/eset_sig400.csv', row.names = 1)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+keytypes(org.Hs.eg.db)
+library(org.Ss.eg.db)
+ego <- enrichGO(gene = eset_sig$symbol, OrgDb = org.Ss.eg.db,
+                 keyType = 'SYMBOL', ont = "ALL",
+                 pAdjustMethod = "BH", pvalueCutoff = 0.05,
+                 qvalueCutoff = 0.05)
+?enrichGO()
+ego@result
+BiocManager::install('org.Ss.eg.db')
+
+
+mb <- c('ADAR1', 'Eif2ak2', 'PKR', 'Mavs', 'MAVS', 'Ifih1', 
+        'MDA5', 'Ddx58', 'RIG-I', 'NTRK1')
+mb <- read.csv('origin/g.csv', header = F)
+mbl <- unlist(as.list(mb))
+mbl <- mbl[!grepl('^$', mbl)]
+MB <- toupper(mbl)
+MB <- as.character(MB)
+
+have <- MB[MB %in% annot2$Gene.Symbol]
+'ADAR' %in% annot2$Gene.Symbol
+library(dplyr)
+unique(annot2$Gene.Symbol) %>% length()
+
+annot <- read.csv('origin/Porcine.na36.annot.csv', comment.char = '#')
+annot2 <- annot[,c(1,15)]
+annot2 <- annot2[!grepl('^---$', annot2$Gene.Symbol),]
+
+
+eset$symbol <- annot2[match(rownames(eset), annot2$Probe.Set.ID), 2]
+eseta <- na.omit(eset)
+eset_s <- eseta[eseta$symbol %in% have, ]
+eset_s$bi23 <- eset_s[,2] / eset_s[,3]
+eset_s$cha23 <- eset_s[,2] - eset_s[,3]
+
+eset_s1 <- eseta[eseta$symbol == 'ADAR', ]
+eset_s1$bi23 <- eset_s1[,3] / eset_s1[,2]
+
+gene_n_s <- na.omit(annot2[match(gene_n, annot2$Probe.Set.ID), 2])
+
+intersect(mb, annot2$Gene.Symbol)
+intersect(MB, annot2$Gene.Symbol) %in% gene_n_s
+
+
+data(litter, package = 'multcomp')
+litter[1:4,1:4]
+
+
+res_l <- apply(eset[,2:3], 1, function(x) {
+  rt <- rbind(expression=x, grade=c(1,2))
+  rt <- as.matrix(t(rt))
+  wilcoxTest <- wilcox.test(expression ~ grade, data=rt)
+  logFC = log2(x[1] + 1)-log2(x[2] + 1)
+  return(c(logFC, wilcoxTest$p.value))
+})
+res_df <- data.frame(t(res_l))
+names(res_df) <- c('logFC', 'pvalue')
+res_df <- with(res_df, res_df[order(logFC),])
+sig <- with(res_df, res_df[abs(logFC) > 1, ])
+
+annot <- read.csv('origin/Porcine.na36.annot.csv', comment.char = '#')
+annot2 <- annot[,c(1,15)]
+annot2 <- annot2[!grepl('^---$', annot2$Gene.Symbol),]
+intersect(annot2$Probe.Set.ID, rownames(eset))
+names(annot)
+mb <- c('ADAR1', 'Eif2ak2', 'PKR', 'Mavs', 'MAVS', 'Ifih1', 'MDA5', 'Ddx58', 'RIG-I', 'NTRK1')
+MB <- toupper(mb)
+sig$symbol <- annot2[match(rownames(sig), annot2$Probe.Set.ID), 2]
+MB %in% annot2$Gene.Symbol
+MB %in% sig$symbol
+
+eset2 <- eset
+eset2$symbol <- annot2[match(rownames(eset2), annot2$Probe.Set.ID), 2]
+eset2 <- na.omit(eset2)
+eset2$d23 <- eset2[,2] / eset2[,3]
+eset2 <- eset2[eset2$d23 > 2 | eset2$d23 < 0.5,]
+
+intersect(eset2$symbol, sig$symbol)
+
+2^-1
+mb %in% eset$symbol
+e <- eset
+table(res_df$pvalue)
 
 test <- gene_diff(eset)
-
-table(sapply(1:10000, function(i) {
-  wilcox.test(ex~grade, t(rbind(ex=eset[i,], grade=c(1,1,2))))$p.value
+i=1
+table(sapply(1:10000, function(ii) {
+  dt <- t(rbind(ex=eset[,2:3][ii,], grade=c(1,2)))
+  wilcox.test(ex~grade, dt)$p.value
 }) )
 
 eset[, c(3,2)][1,],cbind()
